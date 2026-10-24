@@ -6,6 +6,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.*
@@ -125,4 +127,71 @@ class NetworkAccessTest {
         assertEquals(reconnected, reconnected.changed(true))
         assertNull(reconnected.copy(restored = false).message(true))
     }
+    @Test
+    fun `loss during observer installation needs no later callback`() = runBlocking {
+        var online = true
+        var removals = 0
+        val first = withTimeout(1_000) {
+            networkChanges({ online }) {
+                online = false
+                val unsubscribe: () -> Unit = { removals++ }
+                unsubscribe
+            }.first()
+        }
+        assertFalse(first)
+        assertEquals(1, removals)
+    }
+
+    @Test
+    fun `callback during initial snapshot cannot be overwritten by that snapshot`() = runBlocking {
+        var observer: ((Boolean) -> Unit)? = null
+        val sampled = CompletableDeferred<Unit>()
+        val values = mutableListOf<Boolean>()
+        var removals = 0
+        val collector = launch(start = CoroutineStart.UNDISPATCHED) {
+            networkChanges(
+                current = {
+                    // The snapshot was online, but loss is delivered before
+                    // its read returns. There will be no further callback.
+                    observer?.invoke(false)
+                    sampled.complete(Unit)
+                    true
+                },
+                subscribe = { callback ->
+                    observer = callback
+                    val unsubscribe: () -> Unit = { removals++ }
+                    unsubscribe
+                },
+            ).collect { values += it }
+        }
+        withTimeout(1_000) { sampled.await() }
+        // Every producer/collector inherits this runBlocking event loop.
+        // Drain queued sends, including a stale initialization if present.
+        yield()
+        collector.cancelAndJoin()
+        assertEquals(listOf(false), values)
+        assertEquals(1, removals)
+    }
+
+    @Test
+    fun `failed initial snapshot does not leak an installed observer`() = runBlocking {
+        var registrations = 0
+        var removals = 0
+        val failure = IllegalStateException("synthetic snapshot failure")
+        try {
+            networkChanges(
+                current = { throw failure },
+                subscribe = {
+                    registrations++
+                    val unsubscribe: () -> Unit = { removals++ }
+                    unsubscribe
+                },
+            ).first()
+            fail("Snapshot failure should propagate")
+        } catch (e: IllegalStateException) {
+            assertEquals(failure.message, e.message)
+        }
+        assertEquals(registrations, removals)
+    }
+
 }

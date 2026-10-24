@@ -27,9 +27,26 @@ internal fun networkChanges(
     current: () -> Boolean,
     subscribe: ((Boolean) -> Unit) -> (() -> Unit),
 ): Flow<Boolean> = callbackFlow {
-    trySend(current())
-    val unsubscribe = subscribe { trySend(it) }
-    awaitClose { unsubscribe() }
+    val lock = Any()
+    var observed = false
+    // Install first: a network lost before registration may never deliver a
+    // callback. A callback received during the fallback snapshot is newer
+    // than that snapshot, and must not be overwritten by initialization.
+    val unsubscribe = subscribe { online ->
+        synchronized(lock) {
+            observed = true
+            trySend(online)
+        }
+    }
+    try {
+        val initial = current()
+        synchronized(lock) {
+            if (!observed) trySend(initial)
+        }
+        awaitClose()
+    } finally {
+        unsubscribe()
+    }
 }.distinctUntilChanged()
 
 internal data class ConnectionNotice(val online: Boolean, val restored: Boolean = false) {
